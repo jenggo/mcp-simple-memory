@@ -23,6 +23,9 @@ const (
 // Memory represents a single memory entry in the database.
 type Memory struct {
 	ID        int64     `json:"id"`
+	Title     string    `json:"title"`
+	Tags      string    `json:"tags"`
+	Status    string    `json:"status"`
 	Content   string    `json:"content"`
 	CreatedAt time.Time `json:"created_at"`
 }
@@ -57,12 +60,47 @@ func NewSimpleMemoryServer(dbPath string) (*SimpleMemoryServer, error) {
 	schema := `
 	CREATE TABLE IF NOT EXISTS simple_memories (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		title TEXT,
+		tags TEXT,
+		status TEXT,
 		content TEXT NOT NULL,
 		created_at DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 	);
 	`
 	if _, err := db.Exec(schema); err != nil {
 		return nil, fmt.Errorf("failed to create schema: %w", err)
+	}
+
+	// Ensure new columns exist (for migrations)
+	columns := map[string]string{
+		"title":  "ALTER TABLE simple_memories ADD COLUMN title TEXT;",
+		"tags":   "ALTER TABLE simple_memories ADD COLUMN tags TEXT;",
+		"status": "ALTER TABLE simple_memories ADD COLUMN status TEXT;",
+	}
+	for col, stmt := range columns {
+		var found bool
+		rows, err := db.Query("PRAGMA table_info(simple_memories);")
+		if err == nil {
+			defer rows.Close()
+			for rows.Next() {
+				var cid int
+				var name, ctype string
+				var notnull, pk int
+				var dfltValue sql.NullString
+				if err := rows.Scan(&cid, &name, &ctype, &notnull, &dfltValue, &pk); err == nil {
+					if name == col {
+						found = true
+						break
+					}
+				}
+			}
+			if err := rows.Err(); err != nil {
+				return nil, fmt.Errorf("failed to check columns: %w", err)
+			}
+		}
+		if !found {
+			_, _ = db.Exec(stmt)
+		}
 	}
 
 	return &SimpleMemoryServer{
@@ -76,6 +114,9 @@ func NewSimpleMemoryServer(dbPath string) (*SimpleMemoryServer, error) {
 
 // SimpleMemoryAdd inserts a new memory into the database.
 func (s *SimpleMemoryServer) SimpleMemoryAdd(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	title := req.GetString("title", "")
+	tags := req.GetString("tags", "")
+	status := req.GetString("status", "")
 	memory, err := req.RequireString("memory")
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("invalid params: %v", err)), nil
@@ -84,28 +125,47 @@ func (s *SimpleMemoryServer) SimpleMemoryAdd(_ context.Context, req mcp.CallTool
 	if content == "" {
 		return mcp.NewToolResultError("memory cannot be empty"), nil
 	}
-	_, err = s.db.Exec("INSERT INTO simple_memories (content) VALUES (?)", content)
+	_, err = s.db.Exec(
+		"INSERT INTO simple_memories (title, tags, status, content) VALUES (?, ?, ?, ?)",
+		strings.TrimSpace(title), strings.TrimSpace(tags), strings.TrimSpace(status), content,
+	)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to add memory: %v", err)), nil
 	}
 	if !s.disableLogging {
-		s.logger.Printf("[INFO] Added simple-memory: %q", content)
+		s.logger.Printf("[INFO] Added simple-memory: title=%q tags=%q status=%q content=%q", title, tags, status, content)
 	}
 	return mcp.NewToolResultText("Simple-memory added."), nil
 }
 
 // SimpleMemoryList returns all simple-memories, one per line.
 func (s *SimpleMemoryServer) SimpleMemoryList(_ context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	rows, err := s.db.Query("SELECT content FROM simple_memories ORDER BY id ASC")
+	rows, err := s.db.Query("SELECT id, title, tags, status, content, created_at FROM simple_memories ORDER BY id ASC")
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to read simple-memories: %v", err)), nil
 	}
 	defer rows.Close()
 	var memories []string
 	for rows.Next() {
-		var content string
-		if err := rows.Scan(&content); err == nil && strings.TrimSpace(content) != "" {
-			memories = append(memories, content)
+		var (
+			id        int64
+			title     sql.NullString
+			tags      sql.NullString
+			status    sql.NullString
+			content   string
+			createdAt string
+		)
+		if err := rows.Scan(&id, &title, &tags, &status, &content, &createdAt); err == nil && strings.TrimSpace(content) != "" {
+			mem := fmt.Sprintf(
+				`{"id":%d,"title":%q,"tags":%q,"status":%q,"content":%q,"created_at":%q}`,
+				id,
+				title.String,
+				tags.String,
+				status.String,
+				content,
+				createdAt,
+			)
+			memories = append(memories, mem)
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -117,7 +177,7 @@ func (s *SimpleMemoryServer) SimpleMemoryList(_ context.Context, _ mcp.CallToolR
 	return mcp.NewToolResultText(strings.Join(memories, "\n")), nil
 }
 
-// SimpleMemorySearch returns simple-memories containing the query substring.
+// SimpleMemorySearch returns simple-memories matching query in title, tags, status, or content.
 func (s *SimpleMemoryServer) SimpleMemorySearch(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	queryParam, err := req.RequireString("query")
 	if err != nil {
@@ -127,16 +187,38 @@ func (s *SimpleMemoryServer) SimpleMemorySearch(_ context.Context, req mcp.CallT
 	if query == "" {
 		return mcp.NewToolResultError("query cannot be empty"), nil
 	}
-	rows, err := s.db.Query("SELECT content FROM simple_memories WHERE content LIKE ? ORDER BY id ASC", "%"+query+"%")
+	sqlQuery := `
+		SELECT id, title, tags, status, content, created_at
+		FROM simple_memories
+		WHERE title LIKE ? OR tags LIKE ? OR status LIKE ? OR content LIKE ?
+		ORDER BY id ASC
+	`
+	rows, err := s.db.Query(sqlQuery, "%"+query+"%", "%"+query+"%", "%"+query+"%", "%"+query+"%")
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to search simple-memories: %v", err)), nil
 	}
 	defer rows.Close()
 	var matches []string
 	for rows.Next() {
-		var content string
-		if err := rows.Scan(&content); err == nil && strings.TrimSpace(content) != "" {
-			matches = append(matches, content)
+		var (
+			id        int64
+			title     sql.NullString
+			tags      sql.NullString
+			status    sql.NullString
+			content   string
+			createdAt string
+		)
+		if err := rows.Scan(&id, &title, &tags, &status, &content, &createdAt); err == nil && strings.TrimSpace(content) != "" {
+			mem := fmt.Sprintf(
+				`{"id":%d,"title":%q,"tags":%q,"status":%q,"content":%q,"created_at":%q}`,
+				id,
+				title.String,
+				tags.String,
+				status.String,
+				content,
+				createdAt,
+			)
+			matches = append(matches, mem)
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -158,13 +240,17 @@ func (s *SimpleMemoryServer) SimpleMemoryDelete(_ context.Context, req mcp.CallT
 	if query == "" {
 		return mcp.NewToolResultError("query cannot be empty"), nil
 	}
-	res, err := s.db.Exec("DELETE FROM simple_memories WHERE content LIKE ?", "%"+query+"%")
+	sqlQuery := `
+		DELETE FROM simple_memories
+		WHERE title LIKE ? OR tags LIKE ? OR status LIKE ? OR content LIKE ?
+	`
+	res, err := s.db.Exec(sqlQuery, "%"+query+"%", "%"+query+"%", "%"+query+"%", "%"+query+"%")
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to delete simple-memories: %v", err)), nil
 	}
 	n, _ := res.RowsAffected()
 	if !s.disableLogging {
-		s.logger.Printf("[INFO] Deleted %d simple-memories containing %q", n, query)
+		s.logger.Printf("[INFO] Deleted %d simple-memories matching %q in any field", n, query)
 	}
 	if n == 0 {
 		return mcp.NewToolResultText("No simple-memories deleted (no match)."), nil
@@ -209,29 +295,32 @@ func main() {
 			"simple_memory_add",
 			mcp.WithDescription("Append a memory string to the simple-memory database."),
 			mcp.WithString("memory", mcp.Required(), mcp.Description("The memory to add (string).")),
+			mcp.WithString("title", mcp.Description("Optional title for the memory.")),
+			mcp.WithString("tags", mcp.Description("Optional tags for the memory (comma-separated).")),
+			mcp.WithString("status", mcp.Description("Optional status for the memory (e.g., completed, issue, etc.).")),
 		),
 		simpleMemServer.SimpleMemoryAdd,
 	)
 	s.AddTool(
 		mcp.NewTool(
 			"simple_memory_list",
-			mcp.WithDescription("List all simple-memories (one per line)."),
+			mcp.WithDescription("List all simple-memories (one per line, as JSON)."),
 		),
 		simpleMemServer.SimpleMemoryList,
 	)
 	s.AddTool(
 		mcp.NewTool(
 			"simple_memory_search",
-			mcp.WithDescription("Search for simple-memories containing the query substring."),
-			mcp.WithString("query", mcp.Required(), mcp.Description("Substring to search for in simple-memories.")),
+			mcp.WithDescription("Search for simple-memories by substring in title, tags, status, or content."),
+			mcp.WithString("query", mcp.Required(), mcp.Description("Substring to search for in title, tags, status, or content.")),
 		),
 		simpleMemServer.SimpleMemorySearch,
 	)
 	s.AddTool(
 		mcp.NewTool(
 			"simple_memory_delete",
-			mcp.WithDescription("Delete all simple-memories containing the query substring."),
-			mcp.WithString("query", mcp.Required(), mcp.Description("Substring to match for deletion.")),
+			mcp.WithDescription("Delete all simple-memories matching the query substring in title, tags, status, or content."),
+			mcp.WithString("query", mcp.Required(), mcp.Description("Substring to match for deletion in title, tags, status, or content.")),
 		),
 		simpleMemServer.SimpleMemoryDelete,
 	)

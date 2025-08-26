@@ -9,8 +9,9 @@ The MCP Simple-Memory Server is built using the [mark3labs/mcp-go](https://githu
 ## Features
 
 - **Persistent Simple-Memory Storage**: SQLite database with WAL mode for optimal concurrency
-- **Full-Text Search**: Find memories using substring matching
-- **Simple-Memory Management**: Add, list, search, and delete operations
+- **Structured Memory Fields**: Store `title`, `tags`, `status`, `content`, and `created_at` for each memory
+- **Full-Text & Field Search**: Find memories using substring matching across all fields
+- **Simple-Memory Management**: Add, list, search, and delete operations with structured data
 - **Multiple Transport Options**: Support for stdio, HTTP, and SSE transports
 - **Logging**: Configurable rolling log files for debugging and monitoring
 - **Cross-Session Persistence**: Memories survive server restarts and session changes
@@ -73,30 +74,80 @@ SIMPLE_MEMORY_DB_PATH=/path/to/custom/simple-memories.db ./simple-memory-server
 
 ## Available Tools
 
-The server provides four MCP tools for simple-memory management:
+The server provides four MCP tools for simple-memory management, now supporting structured fields:
 
 ### `simple_memory_add`
 
 Add a new simple-memory to the database.
 
 **Parameters:**
-- `simple_memory` (string, required): The simple-memory content to store
+- `memory` (string, required): The main memory content to store
+- `title` (string, optional): Title for the memory
+- `tags` (string, optional): Tags for the memory (comma-separated)
+- `status` (string, optional): Status for the memory (e.g., completed, issue, etc.)
 
 **Example:**
 ```json
 {
   "name": "simple_memory_add",
   "arguments": {
-    "simple_memory": "User prefers Go with clean architecture patterns"
+    "memory": "User prefers Go with clean architecture patterns",
+    "title": "Go Preferences",
+    "tags": "go,architecture,preferences",
+    "status": "learn"
   }
 }
 ```
 
 ### `simple_memory_list`
 
-List all stored simple-memories (one per line).
+List all stored simple-memories as JSON objects, one per line.
 
 **Parameters:** None
+
+**Example Output:**
+```json
+{"id":1,"title":"Go Preferences","tags":"go,architecture,preferences","status":"learn","content":"User prefers Go with clean architecture patterns","created_at":"2024-06-07T12:34:56Z"}
+```
+
+### `simple_memory_search`
+
+Search for memories by substring in any field (`title`, `tags`, `status`, or `content`).
+
+**Parameters:**
+- `query` (string, required): Substring to search for
+
+**Example:**
+```json
+{
+  "name": "simple_memory_search",
+  "arguments": {
+    "query": "completed"
+  }
+}
+```
+
+**Example Output:**
+```json
+{"id":2,"title":"TimescaleDB Restore","tags":"postgresql,timescaledb,backup","status":"completed","content":"Re-initialization after restore implemented.","created_at":"2024-06-07T12:35:00Z"}
+```
+
+### `simple_memory_delete`
+
+Delete all memories matching the query substring in any field.
+
+**Parameters:**
+- `query` (string, required): Substring to match for deletion
+
+**Example:**
+```json
+{
+  "name": "simple_memory_delete",
+  "arguments": {
+    "query": "issue"
+  }
+}
+```
 
 **Example:**
 ```json
